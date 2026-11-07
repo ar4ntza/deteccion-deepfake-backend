@@ -1,66 +1,107 @@
-"""API del detector de audio deepfake.  Ejecutar:  uvicorn main:app --reload --env-file .env"""
+"""API del detector de audio deepfake.
+
+Va en la RAÍZ del proyecto de los modelos, junto a detector/, training/ y resultados_cv/.
+Ejecutar desde esa carpeta:   python -m uvicorn main:app --port 8000
+"""
 import logging
 import os
+import sys
 import tempfile
+import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
+RAIZ = Path(__file__).resolve().parent
+sys.path.insert(0, str(RAIZ))   # para que se puedan importar `detector` y `training`
 
-import audio
-import config as C
-import modelos
+import numpy as np                                                    # noqa: E402
+from fastapi import FastAPI, File, HTTPException, UploadFile          # noqa: E402
+from fastapi.middleware.cors import CORSMiddleware                    # noqa: E402
+
+from detector.inference import Detector                               # noqa: E402
+from training.preprocesamiento import audio_a_mel                     # noqa: E402
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("api")
 
+# Configuración opcional por variables de entorno
+MAX_BYTES = int(os.getenv("MAX_MB", 25)) * 1024 * 1024
+ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
+MAX_MIEMBROS = int(os.getenv("MAX_MIEMBROS", 0)) or None    # limita cuántos modelos del conjunto se cargan por etapa
+RESULTADOS = os.getenv("RESULTADOS_DIR") or None            # por defecto: <raíz>/resultados_cv
+
+estado = {"detector": None, "error": None}
+candado = threading.Lock()      # una inferencia a la vez: evita saturar CPU/GPU con audios simultáneos
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    for m in modelos.MODELOS.values():       # precarga; si falta un archivo, la API arranca igual
-        try:
-            m.asegurar()
-        except Exception as e:
-            log.error("No se pudo cargar %s: %s", m.nombre, e)
+    t0 = time.perf_counter()
+    try:
+        estado["detector"] = Detector(resultados=RESULTADOS, max_miembros=MAX_MIEMBROS)
+        log.info("Modelos cargados en %.1f s", time.perf_counter() - t0)
+    except Exception as e:      # la API arranca igual; /salud y /predict explican qué falló
+        estado["error"] = f"{type(e).__name__}: {e}"
+        log.exception("No se pudieron cargar los modelos")
     yield
 
 
 app = FastAPI(title="Detector de audio deepfake", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=C.ORIGINS, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=ORIGINS, allow_methods=["*"], allow_headers=["*"])
+
+
+def _partes(nombre: str):
+    """'CNN · B preentrenado + afinado' -> ('cnn', 'B')"""
+    arq, _, resto = nombre.partition(" · ")
+    return arq.lower(), resto[:1]
 
 
 @app.get("/salud")
 def salud():
-    return {"ok": True, "dispositivo": str(modelos.DEVICE), "modelos": {n: m.estado() for n, m in modelos.MODELOS.items()}}
+    det = estado["detector"]
+    return {
+        "ok": det is not None,
+        "error": estado["error"],
+        "dispositivo": det.device if det else None,
+        "modelos": {nombre: len(miembros) for nombre, miembros in det.modelos} if det else {},
+    }
 
 
 @app.post("/predict")
-def predict(file: UploadFile = File(...)):
-    datos = file.file.read(C.MAX_BYTES + 1)
-    if len(datos) > C.MAX_BYTES:
-        raise HTTPException(413, f"El audio pesa más de {C.MAX_BYTES // 1024 // 1024} MB.")
+def predict(audio: UploadFile = File(...)):
+    det = estado["detector"]
+    if det is None:
+        raise HTTPException(503, "Los modelos no están cargados. Revisa el registro del servidor.")
 
-    sufijo = Path(file.filename or "").suffix or ".wav"
+    datos = audio.file.read(MAX_BYTES + 1)
+    if len(datos) > MAX_BYTES:
+        raise HTTPException(413, f"El audio pesa más de {MAX_BYTES // 1024 // 1024} MB.")
+    if not datos:
+        raise HTTPException(422, "El archivo está vacío.")
+
+    sufijo = Path(audio.filename or "").suffix or ".wav"
     with tempfile.NamedTemporaryFile(suffix=sufijo, delete=False) as tmp:
         tmp.write(datos)
         ruta = tmp.name
     try:
-        espectro, duracion = audio.espectrograma(ruta)
-    except Exception as e:
-        log.warning("Audio ilegible (%s): %s", file.filename, e)
-        raise HTTPException(422, "No pudimos leer el audio. Prueba con un WAV, MP3 o FLAC válido.")
+        t0 = time.perf_counter()
+        try:
+            mel = audio_a_mel(ruta)
+        except Exception:
+            log.warning("Audio ilegible: %s", audio.filename, exc_info=True)
+            raise HTTPException(422, "No pudimos leer el audio. Prueba con un WAV, MP3 o FLAC válido.")
+        if mel.shape[1] < 10 or np.ptp(mel) < 1e-3:      # misma validación que Detector.analizar
+            raise HTTPException(422, "El audio está vacío o es demasiado corto.")
+        with candado:
+            probs = det.probabilidades(mel)              # {etiqueta: prob_fake 0-1}, ya calibrada y en ensamble
     finally:
         os.unlink(ruta)
 
-    x = audio.preparar(espectro)
-    resp = {}
-    for nombre, m in modelos.MODELOS.items():
-        try:
-            prob, ms = m.predecir(x)
-        except modelos.ModeloNoDisponible as e:
-            raise HTTPException(503, str(e))
-        resp[nombre] = {"prob_fake": round(prob, 4), "ms": round(ms, 1)}
-    resp["info"] = {"duracion_seg": round(duracion, 2),
-                    "analizados_seg": round(min(duracion, C.N_FRAMES * C.HOP_LENGTH / C.SR), 2)}
-    return resp
+    resultados = []
+    for nombre, p in probs.items():
+        arquitectura, condicion = _partes(nombre)
+        fake = round(100 * p, 1)
+        resultados.append({"modelo": nombre, "arquitectura": arquitectura, "condicion": condicion,
+                           "fake": fake, "real": round(100 - fake, 1)})
+    return {"resultados": resultados, "ms_total": round((time.perf_counter() - t0) * 1000)}
