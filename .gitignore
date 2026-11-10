@@ -6,3 +6,6 @@ datos/
 resultados_cv/
 .obsidian
 CAMBIOS_BACKEND.md
+diagnostico_orientacion.py 
+diagnostico_orientacion.csv
+pruebas/
